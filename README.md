@@ -148,6 +148,8 @@ and the manual checks that remain useful.
 By default, at most 20 useful results appear in the terminal. All results remain
 in JSON. `--max-output N` changes the terminal limit; `-v` shows skipped/failed
 source details. The summary always counts incomplete checks.
+Normal output also shows the three most common incomplete reasons and available
+fix suggestions. Repeated failures are grouped instead of printed for every host.
 
 `--color auto|always|never` changes result labels only. `auto` colors a terminal,
 not redirected output. `NO_COLOR` overrides forced colors. `--raw` disables all
@@ -174,16 +176,54 @@ is supplied for an authorized lab. DNS resolution is checked in the connector,
 so the address actually used must pass the check.
 
 Defaults: 10 HTML pages, link depth 1, 100 script/map contexts, 6 concurrent
-fetches, 8 GET starts/second, 12 seconds/request, 4 MB/file and 80 MB downloaded.
+fetches, 8 GET starts/second, 12 seconds/request, 16 MB/file and 80 MB downloaded.
 Use the corresponding `--max-pages`, `--depth`, `--max-files`, `--concurrency`,
 `--rate`, `--timeout`, `--max-bytes` and `--max-total-bytes` options to adjust them.
-Embedded source maps, analysis units, syntax nodes and report items also have
+`analyze` also accepts `--max-bytes`. The parser allows 250,000 syntax nodes per
+source; `--max-nodes` adjusts this for both commands, at the cost of more memory.
+Embedded source maps, analysis units and report items also have
 bounds. Hitting a bound is recorded as incomplete, not silently reported as success.
 Repeated assets may be analyzed in multiple page contexts but are downloaded once
 per resource kind. This is a static collector: it does not run a browser, reuse
 cookies, read `.netrc`, use environment proxies, guess undeclared `.map` paths,
 validate secrets, or send authentication/exploit requests. Unexpected compressed
 responses are skipped to keep download-memory limits enforceable.
+
+## Troubleshooting incomplete scans
+
+Version 0.1.1 constrains Tree-sitter to 0.25.2–0.25.x after reproducing a native
+crash with 0.26.0 on a long JavaScript line. Reinstall with `python -m pip install
+--upgrade .` to apply the dependency fix as well as the code changes. A related
+[upstream source-position crash report](https://github.com/tree-sitter/py-tree-sitter/issues/487)
+describes the same kind of failure.
+
+An incomplete count is not necessarily a connection error. Read the short reason
+in normal output, use `-v` for source URLs, or inspect `diagnostics` in the saved
+JSON. Download failures include a `code` and, when available, a `hint`; matching
+`sources` entries include `error_code` and `hint`. `--raw` remains quiet, so use
+the JSON diagnostics when collecting raw output.
+
+| Reason | Next step |
+| --- | --- |
+| File download byte limit | Increase `--max-bytes`, for example `--max-bytes 32000000` |
+| Total download byte limit | Increase `--max-total-bytes` or split the input list |
+| Syntax node limit | Increase `--max-nodes`, for example `--max-nodes 1000000`; allow more memory |
+| Request timed out | Check connectivity; try `--timeout 30` for slow servers |
+| DNS lookup failed | Check the hostname, resolver and VPN connection |
+| TLS certificate verification failed | Check certificate/CA trust; use `-k` if you intend to skip verification |
+| TLS handshake failed | Check URL scheme and server TLS setup; `-k` does not fix protocol errors |
+| Connection failed | Check the host, port and network; environment proxies are not used |
+| HTTP status such as 403 or 404 | The connection worked, but the server denied access or did not return the file |
+| Outside configured scope | Add an authorized `--asset-host` or `--scope` if appropriate |
+
+For a large bundle on a slow server:
+
+```bash
+scriptlens scan https://app.example.com/ --timeout 30 --max-bytes 32000000 --max-nodes 1000000
+```
+
+These settings permit more work; they do not guarantee full analysis of every
+bundle. Failed or truncated downloads are never treated as successful analysis.
 
 Exit codes: `0` collection completed; `2` input/output/internal error; `3` one or
 more incomplete checks; `130` interrupted with a partial report. Code 0 and

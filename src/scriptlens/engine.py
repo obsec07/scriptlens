@@ -16,11 +16,20 @@ from .security import Redactor
 
 class Engine:
     def __init__(
-        self, fetcher, *, max_files=100, max_pages=10, depth=1, source_maps=True, base_url=None
+        self,
+        fetcher,
+        *,
+        max_files=100,
+        max_pages=10,
+        depth=1,
+        source_maps=True,
+        base_url=None,
+        max_nodes=250_000,
     ):
         self.fetcher, self.scope = fetcher, fetcher.scope
         self.max_files, self.max_pages, self.depth = max_files, max_pages, depth
         self.source_maps, self.base_url = source_maps, base_url
+        self.max_nodes = max_nodes
         self.redactor = Redactor()
         self.report = {
             "schema_version": 1,
@@ -46,9 +55,15 @@ class Engine:
         }
         self.queue, self.seen, self.cache = deque(), set(), {}
         self.pages = self.files = self.analyzed = 0
+        self.analysis_attempts = 0
 
-    def diagnostic(self, url, reason, category="incomplete"):
-        self.report["diagnostics"].append({"source": url, "category": category, "reason": reason})
+    def diagnostic(self, url, reason, category="incomplete", *, code=None, hint=None):
+        item = {"source": url, "category": category, "reason": reason}
+        if code:
+            item["code"] = code
+        if hint:
+            item["hint"] = hint
+        self.report["diagnostics"].append(item)
 
     def enqueue(self, url, kind, document=None, depth=0):
         try:
@@ -74,15 +89,18 @@ class Engine:
         self.queue.append((url, kind, document, depth))
 
     def process_code(self, code, source, document=None, line_offset=0, discover=True):
-        if self.analyzed >= self.max_files * 4:
+        if self.analysis_attempts >= self.max_files * 4:
             self.diagnostic(source, "analysis unit limit reached")
             return
-        self.analyzed += 1
+        self.analysis_attempts += 1
         try:
-            result = analyze(code, source, self.redactor, document, line_offset)
+            result = analyze(
+                code, source, self.redactor, document, line_offset, max_nodes=self.max_nodes
+            )
         except (ValueError, RecursionError) as exc:
             self.diagnostic(source, str(exc) or "analysis recursion limit reached")
             return
+        self.analyzed += 1
         collections = ("endpoints", "findings", "graphql_operations", "unresolved_requests")
         remaining = max(0, 25_000 - sum(len(self.report[name]) for name in collections))
         for name in collections:
@@ -203,7 +221,9 @@ class Engine:
                     {**response.metadata(), "kind": kind, "document_url": document}
                 )
                 if response.error:
-                    self.diagnostic(url, response.error)
+                    self.diagnostic(
+                        url, response.error, code=response.error_code, hint=response.hint
+                    )
                     continue
                 final = response.final_url
                 content_type = response.headers.get("content-type", "").lower()

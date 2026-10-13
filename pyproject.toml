@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scriptlens"
-version = "0.1.0"
+version = "0.1.1"
 description = "Evidence-first JavaScript request and security review for authorized research"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = ["aiohttp>=3.12.14,<4", "tree-sitter>=0.25,<0.27", "tree-sitter-javascript>=0.25,<0.26", "tree-sitter-typescript>=0.23,<0.24"]
+# 0.26.0 can corrupt memory when reading source positions on long minified lines.
+dependencies = ["aiohttp>=3.12.14,<4", "tree-sitter>=0.25.2,<0.26", "tree-sitter-javascript>=0.25,<0.26", "tree-sitter-typescript>=0.23,<0.24"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.12,<1", "build>=1,<2"]

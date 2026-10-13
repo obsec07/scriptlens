@@ -5,8 +5,8 @@ from .security import SENSITIVE, evidence, scan_security
 from .syntax import Syntax, args, field, member, text
 
 
-def analyze(code, source, redactor, document_url=None, line_offset=0):
-    syntax = Syntax(code, source)
+def analyze(code, source, redactor, document_url=None, line_offset=0, *, max_nodes=250_000):
+    syntax = Syntax(code, source, max_nodes=max_nodes)
     requests, unresolved = extract_requests(syntax, source, document_url, line_offset)
     findings = scan_security(syntax, source, redactor, line_offset)
     for request in requests:

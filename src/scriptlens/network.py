@@ -10,6 +10,52 @@ import aiohttp
 from . import __version__
 from .inputs import normalize_url
 
+DEFAULT_MAX_BYTES = 16_000_000
+
+
+class FetchError(ValueError):
+    def __init__(self, code, reason, hint):
+        super().__init__(reason)
+        self.code, self.hint = code, hint
+
+
+class PrivateAddressError(OSError):
+    pass
+
+
+def explain_error(exc, timeout):
+    """Keep transport failures distinct from HTTP responses and collection limits."""
+    if isinstance(exc, FetchError):
+        return exc.code, str(exc), exc.hint
+    underlying = getattr(exc, "os_error", exc)
+    if isinstance(underlying, PrivateAddressError):
+        return "private_address", str(underlying), "Use --allow-private only for your lab."
+    if isinstance(exc, aiohttp.ClientConnectorCertificateError):
+        return (
+            "tls_certificate",
+            "TLS certificate verification failed",
+            "Check the server certificate and local CA trust; -k skips verification if intended.",
+        )
+    if isinstance(exc, (aiohttp.ClientSSLError,)):
+        return "tls_handshake", "TLS handshake failed", "Check the URL scheme and server TLS setup."
+    if isinstance(exc, (socket.gaierror, aiohttp.ClientConnectorDNSError)):
+        return "dns", "DNS lookup failed", "Check the hostname, DNS resolver and VPN connection."
+    if isinstance(exc, TimeoutError):
+        return (
+            "timeout",
+            f"request timed out (budget: {timeout:g}s)",
+            "Check connectivity or increase --timeout (for example, --timeout 30).",
+        )
+    if isinstance(exc, aiohttp.ClientPayloadError):
+        return "response_body", "response body was interrupted or invalid", "Retry the source URL."
+    if isinstance(exc, (aiohttp.ClientConnectionError, OSError)):
+        return (
+            "connection",
+            "connection failed: " + (str(underlying) or type(exc).__name__),
+            "Check the host, port, network and VPN; ScriptLens does not use environment proxies.",
+        )
+    return "fetch", str(exc) or type(exc).__name__, ""
+
 
 class PublicResolver(aiohttp.abc.AbstractResolver):
     def __init__(self, allow_private=False):
@@ -19,7 +65,9 @@ class PublicResolver(aiohttp.abc.AbstractResolver):
     async def resolve(self, host, port=0, family=socket.AF_INET):
         records = await self.inner.resolve(host, port, family)
         if not self.allow_private and any(not public_ip(r["host"]) for r in records):
-            raise OSError("non-public address blocked; use --allow-private for your lab")
+            raise PrivateAddressError(
+                "non-public address blocked; use --allow-private for your lab"
+            )
         return records
 
     async def close(self):
@@ -41,6 +89,8 @@ class Response:
     body: bytes = b""
     headers: dict = field(default_factory=dict)
     error: str | None = None
+    error_code: str | None = None
+    hint: str | None = None
 
     def metadata(self):
         return {
@@ -50,6 +100,8 @@ class Response:
             "bytes": len(self.body),
             "sha256": hashlib.sha256(self.body).hexdigest() if self.body else None,
             "error": self.error,
+            "error_code": self.error_code,
+            "hint": self.hint,
         }
 
 
@@ -59,7 +111,7 @@ class Fetcher:
         scope,
         *,
         timeout=12,
-        max_bytes=4_000_000,
+        max_bytes=DEFAULT_MAX_BYTES,
         max_total=80_000_000,
         concurrency=6,
         rate=8,
@@ -97,6 +149,7 @@ class Fetcher:
         try:
             current = normalize_url(url)
             for _ in range(6):
+                result.final_url, result.status = current, None
                 if not self.scope.allows(current, kind):
                     raise ValueError("outside configured scope")
                 from urllib.parse import urlsplit
@@ -107,9 +160,11 @@ class Fetcher:
                 except ValueError:
                     numeric = None
                 if numeric is not None and not self.allow_private and not public_ip(host):
-                    raise ValueError("non-public address blocked; use --allow-private for your lab")
+                    raise PrivateAddressError(
+                        "non-public address blocked; use --allow-private for your lab"
+                    )
                 if self.total >= self.max_total:
-                    raise ValueError("total download byte limit reached")
+                    raise self.total_limit_error()
                 async with self.lock:
                     loop = asyncio.get_running_loop()
                     await asyncio.sleep(max(0, self.last_start + 1 / self.rate - loop.time()))
@@ -130,7 +185,11 @@ class Fetcher:
                         current = normalize_url(urljoin(current, location))
                         continue
                     if response.status != 200:
-                        raise ValueError(f"HTTP {response.status}")
+                        raise FetchError(
+                            "http_status",
+                            f"HTTP {response.status}",
+                            "The server responded; check the URL and whether access is restricted.",
+                        )
                     if response.headers.get("Content-Encoding", "identity").lower() not in {
                         "",
                         "identity",
@@ -142,12 +201,26 @@ class Fetcher:
                     async for chunk in response.content.iter_chunked(65536):
                         size += len(chunk)
                         self.total += len(chunk)
-                        if size > self.max_bytes or self.total > self.max_total:
-                            raise ValueError("download byte limit reached")
+                        if self.total > self.max_total:
+                            raise self.total_limit_error()
+                        if size > self.max_bytes:
+                            raise FetchError(
+                                "file_byte_limit",
+                                f"file download byte limit reached ({self.max_bytes:,} bytes)",
+                                "Increase --max-bytes for this bundle "
+                                f"(for example, --max-bytes {self.max_bytes * 2}).",
+                            )
                         chunks.append(chunk)
                     result.body = b"".join(chunks)
                     return result
             raise ValueError("too many redirects")
         except (TimeoutError, ValueError, UnicodeError, OSError, aiohttp.ClientError) as exc:
-            result.error = str(exc) or type(exc).__name__
+            result.error_code, result.error, result.hint = explain_error(exc, self.timeout)
             return result
+
+    def total_limit_error(self):
+        return FetchError(
+            "total_byte_limit",
+            f"total download byte limit reached ({self.max_total:,} bytes)",
+            "Increase --max-total-bytes or scan fewer inputs at a time.",
+        )

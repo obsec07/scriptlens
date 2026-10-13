@@ -7,13 +7,14 @@ import os
 import re
 import secrets
 import sys
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __version__
 from .engine import Engine
 from .inputs import Scope, load_targets, normalize_url
-from .network import Fetcher
+from .network import DEFAULT_MAX_BYTES, Fetcher
 
 
 class PlainParser(argparse.ArgumentParser):
@@ -78,9 +79,6 @@ def parser():
         "--rate", type=positive_float, default=8, help="GET starts per second (default 8)"
     )
     scan.add_argument("--timeout", type=positive_float, default=12)
-    scan.add_argument(
-        "--max-bytes", type=positive_int, default=4_000_000, help="bytes per download"
-    )
     scan.add_argument("--max-total-bytes", type=positive_int, default=80_000_000)
     scan.add_argument("--no-source-maps", action="store_true", help="skip declared source maps")
     scan.add_argument(
@@ -100,6 +98,18 @@ def parser():
     )
     local.add_argument("files", nargs="+", type=Path)
     for command in (scan, local):
+        command.add_argument(
+            "--max-bytes",
+            type=positive_int,
+            default=DEFAULT_MAX_BYTES,
+            help="bytes per download or local file (default: 16000000)",
+        )
+        command.add_argument(
+            "--max-nodes",
+            type=positive_int,
+            default=250_000,
+            help="syntax nodes per source (default: 250000); higher values use more memory",
+        )
         command.add_argument(
             "--base-url",
             type=normalize_url,
@@ -195,12 +205,25 @@ def print_report(report, path, args):
     if args.verbose:
         for item in report["diagnostics"]:
             print(f"[SKIP] {plain(item['source'])} - {plain(item['reason'])}")
+            if item.get("hint"):
+                print("  " + plain(item["hint"]))
     if not args.raw:
         summary = report["summary"]
         print(
             f"Done: {summary['analyzed_sources']} sources, {summary['endpoints']} endpoints, "
             f"{summary['review_items']} review items, {summary['incomplete']} incomplete."
         )
+        if summary["incomplete"] and not args.verbose:
+            problems = Counter(
+                (d["reason"], d.get("hint", ""))
+                for d in report["diagnostics"]
+                if d["category"] == "incomplete"
+            )
+            for (reason, hint), count in problems.most_common(3):
+                print(f"Incomplete ({count}): {plain(reason)}")
+                if hint:
+                    print("  " + plain(hint))
+            print("Details: diagnostics in the JSON report, or rerun with -v.")
         if summary["review_items"] + summary["endpoints"] > args.max_output:
             print("More results are in the JSON report.")
         print("Saved: " + plain(path))
@@ -229,14 +252,19 @@ def run(args):
             depth=args.depth,
             source_maps=not args.no_source_maps,
             base_url=args.base_url,
+            max_nodes=args.max_nodes,
         )
     else:
         for path in args.files:
             if not path.is_file():
                 raise ValueError(f"not a file: {path}")
-        fetcher = Fetcher(Scope([]))
+        fetcher = Fetcher(Scope([]), max_bytes=args.max_bytes)
         engine = Engine(
-            fetcher, max_files=args.max_files, source_maps=False, base_url=args.base_url
+            fetcher,
+            max_files=args.max_files,
+            source_maps=False,
+            base_url=args.base_url,
+            max_nodes=args.max_nodes,
         )
     output = args.output or Path("scriptlens-results") / (
         datetime.now(UTC).strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(3) + ".json"
@@ -257,7 +285,12 @@ def run(args):
                 engine.report["targets"] = [str(path.resolve()) for path in args.files]
                 for path in args.files:
                     if path.stat().st_size > fetcher.max_bytes:
-                        engine.diagnostic(str(path), "local file byte limit reached")
+                        engine.diagnostic(
+                            str(path),
+                            f"local file byte limit reached ({args.max_bytes:,} bytes)",
+                            code="file_byte_limit",
+                            hint="Increase --max-bytes for this file.",
+                        )
                         continue
                     raw = path.read_bytes()
                     engine.report["sources"].append(
@@ -283,6 +316,10 @@ def run(args):
         report["settings"] = {
             "tls_verification": not getattr(args, "insecure", False),
             "max_files": args.max_files,
+            "max_bytes": args.max_bytes,
+            "max_total_bytes": fetcher.max_total if args.command == "scan" else None,
+            "max_nodes": args.max_nodes,
+            "timeout_seconds": fetcher.timeout if args.command == "scan" else None,
             "base_url": args.base_url,
             "secrets_redacted": True,
             "mode": args.command,

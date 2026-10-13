@@ -92,3 +92,33 @@ def test_no_color_overrides_forced_result_color(tmp_path, monkeypatch, capsys):
     source.write_text("fetch('/api',{method:'POST'})")
     assert main(["analyze", str(source), "-o", str(tmp_path / "r.json"), "--color", "always"]) == 0
     assert "\x1b" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("raw", [False, True])
+def test_limit_reason_visible_by_default_but_raw_stays_quiet(tmp_path, capsys, raw):
+    source = tmp_path / "bundle.js"
+    source.write_text("fetch('/api')" * 20)
+    output = tmp_path / "report.json"
+    command = ["analyze", str(source), "--max-bytes", "20", "-o", str(output)]
+    assert main(command + (["--raw"] if raw else [])) == 3
+    console = capsys.readouterr().out
+    report = json.loads(output.read_text())
+    assert report["diagnostics"][0]["code"] == "file_byte_limit"
+    assert report["settings"]["max_bytes"] == 20
+    if raw:
+        assert console == ""
+    else:
+        assert "local file byte limit reached (20 bytes)" in console
+        assert "Increase --max-bytes" in console
+        assert "\x1b" not in console
+
+
+def test_parser_limit_can_be_raised_and_failed_parse_not_counted_as_analyzed(tmp_path, capsys):
+    source = tmp_path / "app.js"
+    source.write_text("fetch('/api')")
+    small, large = tmp_path / "small.json", tmp_path / "large.json"
+    assert main(["analyze", str(source), "--max-nodes", "2", "-o", str(small)]) == 3
+    assert json.loads(small.read_text())["summary"]["analyzed_sources"] == 0
+    assert "increase --max-nodes" in capsys.readouterr().out
+    assert main(["analyze", str(source), "--max-nodes", "100", "-o", str(large)]) == 0
+    assert len(json.loads(large.read_text())["endpoints"]) == 1

@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 
@@ -48,6 +49,14 @@ async def lab():
             raise web.HTTPFound("http://localhost:" + str(request.url.port) + "/forbidden")
         if request.path == "/large.js":
             return web.Response(body=b"x" * 10000, content_type="application/javascript")
+        if request.path == "/bundle-over-4mb.js":
+            return web.Response(
+                body=b"/*" + b"x" * 4_100_000 + b"*/fetch('/large-bundle-api')",
+                content_type="application/javascript",
+            )
+        if request.path == "/slow.js":
+            await asyncio.sleep(0.1)
+            return web.Response(text="fetch('/slow')", content_type="application/javascript")
         if request.path == "/compressed.js":
             return web.Response(body=b"not-really-gzip", headers={"Content-Encoding": "gzip"})
         if request.path == "/html.js":
@@ -211,3 +220,51 @@ async def test_same_script_keeps_different_page_resolution_contexts():
         "https://app.test/a/relative",
         "https://app.test/b/relative",
     }
+
+
+async def test_bundle_above_old_limit_is_analyzed_with_new_defaults(lab):
+    base, _ = lab
+    async with Fetcher(Scope([base]), allow_private=True, rate=1000) as fetcher:
+        report = await Engine(fetcher, base_url=base).run([base + "/bundle-over-4mb.js"])
+    assert report["complete"]
+    assert report["summary"]["analyzed_sources"] == 1
+    assert report["endpoints"][0]["url"] == base + "/large-bundle-api"
+    assert report["endpoints"][0]["evidence"][0]["column"] == 4_100_005
+
+
+@pytest.mark.parametrize(
+    "options,code,flag",
+    [
+        ({"max_bytes": 1000}, "file_byte_limit", "--max-bytes"),
+        ({"max_total": 1000}, "total_byte_limit", "--max-total-bytes"),
+    ],
+)
+async def test_download_limits_have_distinct_actionable_diagnostics(lab, options, code, flag):
+    base, _ = lab
+    async with Fetcher(Scope([base]), allow_private=True, rate=1000, **options) as fetcher:
+        report = await Engine(fetcher).run([base + "/large.js"])
+    assert not report["complete"]
+    assert not report["endpoints"]
+    diagnostic = report["diagnostics"][0]
+    assert diagnostic["code"] == code
+    assert flag in diagnostic["hint"]
+    assert report["sources"][0]["error_code"] == code
+    assert "1,000" in diagnostic["reason"]
+
+
+async def test_timeout_is_saved_with_useful_reason(lab):
+    base, _ = lab
+    async with Fetcher(Scope([base]), allow_private=True, timeout=0.01) as fetcher:
+        report = await Engine(fetcher).run([base + "/slow.js"])
+    assert report["diagnostics"][0]["code"] == "timeout"
+    assert "--timeout" in report["diagnostics"][0]["hint"]
+    assert report["sources"][0]["final_url"] == base + "/slow.js"
+
+
+async def test_http_error_is_not_reported_as_connection_failure(lab):
+    base, _ = lab
+    async with Fetcher(Scope([base]), allow_private=True) as fetcher:
+        response = await fetcher.get(base + "/missing.js")
+    assert response.status == 404
+    assert response.error == "HTTP 404"
+    assert response.error_code == "http_status"

@@ -128,7 +128,10 @@ class Syntax:
         for node in walk(self.tree.root_node):
             self.nodes.append(node)
             if len(self.nodes) > max_nodes:
-                raise ValueError("syntax node limit reached")
+                raise ValueError(
+                    f"syntax node limit reached ({max_nodes:,}); "
+                    "increase --max-nodes for this bundle (uses more memory)"
+                )
         self.bindings = {}
         self.imports = {}
         self.mutated = set()
