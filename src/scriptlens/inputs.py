@@ -34,6 +34,15 @@ def load_targets(values, lists, stdin, max_targets=1000):
     seen = set()
     used_stdin = False
     for value, is_file in [(v, False) for v in values] + [(v, True) for v in lists]:
+        if "://" not in value and value != "-":
+            path = Path(value)
+            if path.is_dir():
+                raise ValueError(f"expected a domain/URL list file, got a directory: {value}")
+            if not path.is_file() and (
+                value.startswith(("/", "./", "../", "~"))
+                or path.suffix.lower() in {".txt", ".list", ".lst"}
+            ):
+                raise ValueError(f"input list file does not exist: {value}")
         if is_file or value == "-" or ("://" not in value and Path(value).is_file()):
             if value == "-":
                 if used_stdin:
@@ -41,7 +50,7 @@ def load_targets(values, lists, stdin, max_targets=1000):
                 used_stdin = True
                 lines = stdin
             else:
-                lines = Path(value).read_text(encoding="utf-8").splitlines()
+                lines = Path(value).read_text(encoding="utf-8-sig").splitlines()
         else:
             lines = [value]
         for line in lines:

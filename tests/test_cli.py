@@ -6,6 +6,7 @@ import sys
 import pytest
 
 from scriptlens.cli import main
+from scriptlens.network import Fetcher, Response
 
 
 @pytest.mark.parametrize("command", [[], ["scan"], ["analyze"]])
@@ -122,3 +123,67 @@ def test_parser_limit_can_be_raised_and_failed_parse_not_counted_as_analyzed(tmp
     assert "increase --max-nodes" in capsys.readouterr().out
     assert main(["analyze", str(source), "--max-nodes", "100", "-o", str(large)]) == 0
     assert len(json.loads(large.read_text())["endpoints"]) == 1
+
+
+@pytest.mark.parametrize(
+    "arguments,expected",
+    [
+        (["-u", "example.test"], ["https://example.test/"]),
+        (["-u", "https://example.test/app"], ["https://example.test/app"]),
+        (["-u", "http://example.test/"], ["http://example.test/"]),
+        (["-u", "LIST"], ["https://example.test/", "https://other.test/app"]),
+        (
+            ["-u", "example.test", "-u", "https://other.test/app"],
+            ["https://example.test/", "https://other.test/app"],
+        ),
+        (["scan", "-d", "example.test"], ["https://example.test/"]),
+        (["scan", "-l", "LIST"], ["https://example.test/", "https://other.test/app"]),
+        (["example.test"], ["https://example.test/"]),
+    ],
+)
+def test_simple_input_flows_save_json(tmp_path, monkeypatch, capsys, arguments, expected):
+    monkeypatch.chdir(tmp_path)
+    listing = tmp_path / "domains.txt"
+    listing.write_text("example.test\nhttps://other.test/app\nhttps://example.test/\n")
+    requested = []
+
+    async def fake_get(self, url, kind):
+        requested.append(url)
+        return Response(
+            url, url, 200, b"<script>fetch('/api')</script>", {"content-type": "text/html"}
+        )
+
+    monkeypatch.setattr(Fetcher, "get", fake_get)
+    assert main([str(listing) if arg == "LIST" else arg for arg in arguments]) == 0
+    report = json.loads(next((tmp_path / "scriptlens-results").glob("*.json")).read_text())
+    assert report["targets"] == expected
+    assert requested == expected
+    assert len(report["endpoints"]) == len(expected)
+
+
+@pytest.mark.parametrize("arguments", [[], ["--help"], ["scan", "--help"]])
+def test_basic_help_is_short_and_points_to_advanced_help(arguments, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(arguments)
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "-u" in output and "domains.txt" in output
+    assert "--help-all" in output
+    assert "--max-nodes" not in output and "--scope" not in output
+    assert "\x1b" not in output
+
+
+def test_advanced_help_exposes_existing_controls(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--help-all"])
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "--max-nodes" in output and "--scope" in output and "--insecure" in output
+    assert "\x1b" not in output
+
+
+def test_missing_list_does_not_start_a_scan(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    assert main(["-u", "missing.txt"]) == 2
+    assert "input list file does not exist" in capsys.readouterr().err
+    assert not (tmp_path / "scriptlens-results").exists()

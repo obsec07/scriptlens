@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scriptlens"
-version = "0.1.1"
+version = "0.1.2"
 description = "Evidence-first JavaScript request and security review for authorized research"
 readme = "README.md"
 requires-python = ">=3.11"

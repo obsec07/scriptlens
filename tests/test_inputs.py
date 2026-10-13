@@ -17,6 +17,27 @@ def test_lists_domains_urls_and_duplicates(tmp_path):
     ]
 
 
+def test_list_accepts_utf8_bom_crlf_comments_and_mixed_inputs(tmp_path):
+    path = tmp_path / "domains.txt"
+    path.write_bytes(b"\xef\xbb\xbfexample.test\r\n# comment\r\n\r\nhttps://other.test/app\r\n")
+    assert load_targets([str(path)], [], io.StringIO()) == [
+        "https://example.test/",
+        "https://other.test/app",
+    ]
+
+
+@pytest.mark.parametrize("value", ["missing.txt", "missing.lst", "./missing", "../missing"])
+def test_missing_list_is_not_mistaken_for_hostname(tmp_path, monkeypatch, value):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="input list file does not exist"):
+        load_targets([value], [], io.StringIO())
+
+
+def test_directory_is_not_a_target_list(tmp_path):
+    with pytest.raises(ValueError, match="got a directory"):
+        load_targets([str(tmp_path)], [], io.StringIO())
+
+
 @pytest.mark.parametrize(
     "value",
     [

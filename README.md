@@ -36,34 +36,61 @@ scriptlens --version
 
 ## Run it
 
-Use only assets you are authorized to inspect. Domains default to HTTPS. Supply
-an explicit `http://` URL for HTTP. TLS certificates are verified by default;
-`-k`, `--insecure`, and `--no-ssl-verify` disable this check.
+Use `-u` for a domain, a URL, or a file. No `scan` command or tuning flags are
+needed. Inspect only assets you are authorized to access.
 
 ```bash
-# Single domain, URL, or several targets
-scriptlens scan example.com
-scriptlens scan example.com https://app.example.com/dashboard
+scriptlens -u example.com
+scriptlens -u https://example.com/
+scriptlens -u domains.txt
+```
 
-# One hostname/URL per line; duplicate targets are removed
-scriptlens scan hosts.txt
-scriptlens scan -l domains.txt -l urls.txt -o results.json
-cat urls.txt | scriptlens scan -
+A list file can contain bare domains, full URLs, or both, one per line:
 
-# Equivalent explicit flags
-scriptlens scan -d example.com -u https://app.example.com/
+```text
+example.com
+https://app.example.com/dashboard
+http://legacy.example.com/
+```
 
-# Plain output with curl templates; JSON is still saved automatically
-scriptlens scan -l urls.txt --raw --show-curl -o requests.json
+Bare domains use HTTPS. Explicit URLs keep their scheme and path. Duplicate
+inputs, blank lines and `#` comment lines are ignored. UTF-8 files with a BOM and
+Windows line endings are supported. A missing `.txt`, `.list` or `.lst` file
+produces an input error rather than a request to a hostname with that name.
 
-# Direct JS input: supply the page URL to resolve relative fetch URLs correctly
-scriptlens scan https://cdn.example.com/app.js --base-url https://app.example.com/
+Results, endpoint data and curl templates save automatically as JSON in
+`scriptlens-results/`. To choose a filename:
 
-# Authorized sibling hosts and CDN assets
-scriptlens scan https://app.example.com/ --scope example.com --asset-host cdn.example.net
+```bash
+scriptlens -u domains.txt -o results.json
+```
 
-# Analyze downloaded code without any network requests
-scriptlens analyze bundle.js original.ts app.js.map --base-url https://app.example.com/ -o local.json
+`scriptlens --help` shows the short help. `scriptlens --help-all` shows advanced
+controls when you need them. Help is always plain text.
+
+<details>
+<summary>Advanced usage and existing commands</summary>
+
+Repeat `-u` to combine inputs. Existing `scan`, positional inputs, `-d` and `-l`
+commands continue to work.
+
+```bash
+scriptlens -u example.com -u https://app.example.com/dashboard
+cat urls.txt | scriptlens -u -
+scriptlens scan -l domains.txt
+
+# Plain result lines and visible curl templates
+scriptlens -u urls.txt --raw --show-curl
+
+# Direct JS input with the page URL for relative requests
+scriptlens -u https://cdn.example.com/app.js --base-url https://app.example.com/
+
+# Additional authorized asset hosts
+scriptlens -u https://app.example.com/ --scope example.com --asset-host cdn.example.net
+
+# Local JS/TS files, without network requests
+scriptlens analyze bundle.js original.ts --base-url https://app.example.com/
+scriptlens analyze --help-all
 
 # Offline example included in the repository
 scriptlens analyze tests/fixtures/demo.js --base-url https://demo.example.test/ --show-curl
@@ -72,6 +99,10 @@ scriptlens analyze tests/fixtures/demo.js --base-url https://demo.example.test/ 
 `--base-url` is the **document URL**, not the script directory. A script served
 from a CDN can make relative API calls against the page's origin. When this
 context is unknown, ScriptLens uses `{{BASE_URL}}` rather than inventing a host.
+TLS certificates are verified by default; `-k`, `--insecure`, and
+`--no-ssl-verify` disable this check when explicitly requested.
+
+</details>
 
 ## What you get
 

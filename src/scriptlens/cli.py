@@ -38,7 +38,7 @@ def positive_float(value):
     return number
 
 
-def parser():
+def parser(advanced=False):
     root = PlainParser(
         prog="scriptlens",
         description="Find JavaScript requests and useful security review clues. "
@@ -47,11 +47,33 @@ def parser():
     root.add_argument("--version", action="version", version=__version__)
     commands = root.add_subparsers(dest="command", required=True)
     scan = commands.add_parser(
-        "scan", help="fetch pages, scripts, imports and declared source maps"
+        "scan",
+        help="fetch pages, scripts, imports and declared source maps",
+        prog="scriptlens",
+        description="Give a domain, URL, or list file. Fetch JavaScript and save results as JSON.",
+        epilog="Examples:\n  scriptlens -u example.com\n"
+        "  scriptlens -u https://example.com/\n  scriptlens -u domains.txt\n\n"
+        "List files: one domain or URL per line; mixing both is OK.\n"
+        "Bare domains use HTTPS. JSON is saved automatically in scriptlens-results/.\n"
+        "For local JavaScript files: scriptlens analyze --help",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     scan.add_argument("targets", nargs="*", help="domains, URLs, list files, or '-' for stdin")
     scan.add_argument(
-        "-d", "--domain", "-u", "--url", action="append", default=[], dest="extra_targets"
+        "-u",
+        "--url",
+        action="append",
+        default=[],
+        dest="extra_targets",
+        metavar="INPUT",
+        help="domain, HTTP(S) URL, or domain/URL list file (repeatable)",
+    )
+    scan.add_argument(
+        "-d",
+        "--domain",
+        action="append",
+        dest="extra_targets",
+        help=argparse.SUPPRESS,
     )
     scan.add_argument(
         "-l",
@@ -98,6 +120,8 @@ def parser():
     )
     local.add_argument("files", nargs="+", type=Path)
     for command in (scan, local):
+        command.add_argument("--help-all", action="help", help="show all advanced options")
+        command.add_argument("--version", action="version", version=__version__)
         command.add_argument(
             "--max-bytes",
             type=positive_int,
@@ -150,6 +174,11 @@ def parser():
         command.add_argument(
             "-v", "--verbose", action="store_true", help="show skipped/incomplete source details"
         )
+        if not advanced:
+            basic = {"help", "help_all", "extra_targets", "output", "files"}
+            for action in command._actions:
+                if action.dest not in basic:
+                    action.help = argparse.SUPPRESS
     return root
 
 
@@ -332,7 +361,12 @@ def run(args):
 
 
 def main(argv=None):
-    args = parser().parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        argv = ["--help"]
+    if argv[0] not in {"scan", "analyze"}:
+        argv.insert(0, "scan")
+    args = parser(advanced="--help-all" in argv).parse_args(argv)
     try:
         return run(args)
     except (OSError, ValueError, UnicodeError) as exc:
