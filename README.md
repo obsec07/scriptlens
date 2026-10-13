@@ -45,6 +45,22 @@ scriptlens -u https://example.com/
 scriptlens -u domains.txt
 ```
 
+Lists support up to **100,000 unique targets**. To scan only the first 500 or
+50,000 entries, use the optional count flag:
+
+```bash
+scriptlens -u domains.txt --number-of-domains 500
+scriptlens -u domains.txt -n 50000
+```
+
+The count applies after removing duplicates and skipping comments/blank lines,
+in file order. It counts unique domain/URL entries, so different URL paths on the
+same hostname count separately. If the file has fewer entries, all are used.
+Without this flag, all entries are selected, up to 100,000; larger lists produce
+an input error instead of being silently cut off. `-number-of-domaint` is also
+accepted as a compatibility alias. The count does not increase concurrency or
+request rate.
+
 A list file can contain bare domains, full URLs, or both, one per line:
 
 ```text
@@ -206,16 +222,29 @@ request. Private and loopback destinations are blocked unless `--allow-private`
 is supplied for an authorized lab. DNS resolution is checked in the connector,
 so the address actually used must pass the check.
 
-Defaults: 10 HTML pages, link depth 1, 100 script/map contexts, 6 concurrent
-fetches, 8 GET starts/second, 12 seconds/request, 16 MB/file and 80 MB downloaded.
+Defaults per input: 10 HTML pages, 100 script/map contexts and an 80 MB download
+budget. Inputs run in batches no larger than the concurrency setting; each batch
+pools these budgets across its inputs, then resets them for the next batch.
+This keeps early inputs from consuming the budgets for the entire list.
+Other defaults: link depth 1, 6 concurrent fetches, 8 GET starts/second,
+12 seconds/request and 16 MB/file. `--max-pages`, `--max-files` and
+`--max-total-bytes` set the per-input budgets that are pooled within a batch.
 Use the corresponding `--max-pages`, `--depth`, `--max-files`, `--concurrency`,
 `--rate`, `--timeout`, `--max-bytes` and `--max-total-bytes` options to adjust them.
 `analyze` also accepts `--max-bytes`. The parser allows 250,000 syntax nodes per
 source; `--max-nodes` adjusts this for both commands, at the cost of more memory.
 Embedded source maps, analysis units and report items also have
 bounds. Hitting a bound is recorded as incomplete, not silently reported as success.
-Repeated assets may be analyzed in multiple page contexts but are downloaded once
-per resource kind. This is a static collector: it does not run a browser, reuse
+Extraction has a budget of 25,000 items per input across endpoints, findings,
+GraphQL operations and unresolved requests, also pooled within each batch.
+Hitting that budget marks the affected extraction incomplete without preventing
+later batches from retaining their results. The combined JSON report can exceed
+25,000 items. Report data remains in memory, so large runs need more memory and
+disk space; the input limit is not a guarantee of a particular run time or RAM use.
+Repeated assets may be analyzed in multiple page contexts. Downloads are reused
+within a batch while cached; the cache retains at most 128 completed entries and
+64 MB of bodies, and is released between batches. Evicted assets may be downloaded
+again. This is a static collector: it does not run a browser, reuse
 cookies, read `.netrc`, use environment proxies, guess undeclared `.map` paths,
 validate secrets, or send authentication/exploit requests. Unexpected compressed
 responses are skipped to keep download-memory limits enforceable.

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import __version__
 from .engine import Engine
-from .inputs import Scope, load_targets, normalize_url
+from .inputs import MAX_TARGETS, Scope, load_targets, normalize_url
 from .network import DEFAULT_MAX_BYTES, Fetcher
 
 
@@ -35,6 +35,13 @@ def positive_float(value):
     number = float(value)
     if not math.isfinite(number) or number <= 0:
         raise argparse.ArgumentTypeError("must be a finite number greater than zero")
+    return number
+
+
+def target_count(value):
+    number = positive_int(value)
+    if number > MAX_TARGETS:
+        raise argparse.ArgumentTypeError(f"must be {MAX_TARGETS:,} or less")
     return number
 
 
@@ -76,6 +83,20 @@ def parser(advanced=False):
         help=argparse.SUPPRESS,
     )
     scan.add_argument(
+        "-n",
+        "--number-of-domains",
+        type=target_count,
+        dest="number_of_domains",
+        metavar="N",
+        help="scan the first N unique targets (default: all, up to 100000)",
+    )
+    scan.add_argument(
+        "-number-of-domaint",
+        type=target_count,
+        dest="number_of_domains",
+        help=argparse.SUPPRESS,
+    )
+    scan.add_argument(
         "-l",
         "--list",
         action="append",
@@ -92,7 +113,12 @@ def parser(advanced=False):
         default=[],
         help="also allow scripts/maps from this exact hostname",
     )
-    scan.add_argument("--max-pages", type=positive_int, default=10)
+    scan.add_argument(
+        "--max-pages",
+        type=positive_int,
+        default=10,
+        help="page budget per input, pooled within a batch (default: 10)",
+    )
     scan.add_argument(
         "--depth", type=int, choices=range(0, 4), default=1, help="HTML link depth (default 1)"
     )
@@ -101,7 +127,12 @@ def parser(advanced=False):
         "--rate", type=positive_float, default=8, help="GET starts per second (default 8)"
     )
     scan.add_argument("--timeout", type=positive_float, default=12)
-    scan.add_argument("--max-total-bytes", type=positive_int, default=80_000_000)
+    scan.add_argument(
+        "--max-total-bytes",
+        type=positive_int,
+        default=80_000_000,
+        help="download byte budget per input, pooled within a batch (default: 80000000)",
+    )
     scan.add_argument("--no-source-maps", action="store_true", help="skip declared source maps")
     scan.add_argument(
         "-k",
@@ -175,7 +206,7 @@ def parser(advanced=False):
             "-v", "--verbose", action="store_true", help="show skipped/incomplete source details"
         )
         if not advanced:
-            basic = {"help", "help_all", "extra_targets", "output", "files"}
+            basic = {"help", "help_all", "extra_targets", "output", "files", "number_of_domains"}
             for action in command._actions:
                 if action.dest not in basic:
                     action.help = argparse.SUPPRESS
@@ -262,7 +293,9 @@ def run(args):
     if args.command == "scan":
         if args.concurrency > 32:
             raise ValueError("--concurrency must be 32 or less")
-        targets = load_targets(args.targets + args.extra_targets, args.lists, sys.stdin)
+        targets = load_targets(
+            args.targets + args.extra_targets, args.lists, sys.stdin, limit=args.number_of_domains
+        )
         scope = Scope(targets, args.scope, args.asset_host)
         fetcher = Fetcher(
             scope,
@@ -352,6 +385,11 @@ def run(args):
             "base_url": args.base_url,
             "secrets_redacted": True,
             "mode": args.command,
+            "number_of_domains": getattr(args, "number_of_domains", None),
+            "max_pages": getattr(args, "max_pages", None),
+            "scan_budget_scope": "per input, pooled within each batch"
+            if args.command == "scan"
+            else None,
         }
         report = engine.redactor.clean(report)
         json.dump(report, stream, indent=2, ensure_ascii=True)

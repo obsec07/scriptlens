@@ -268,3 +268,68 @@ async def test_http_error_is_not_reported_as_connection_failure(lab):
     assert response.status == 404
     assert response.error == "HTTP 404"
     assert response.error_code == "http_status"
+
+
+async def test_bulk_scan_reaches_later_inputs_with_fresh_page_file_and_byte_budgets():
+    targets = [f"https://host{i}.example.test/" for i in range(1001)]
+    visited = []
+
+    class BulkFetcher:
+        scope = Scope(targets)
+        concurrency = 2
+        max_bytes = 1000
+        max_total = 100
+        total = 0
+
+        async def get(self, url, kind):
+            assert self.total < self.max_total, "earlier inputs exhausted the download budget"
+            self.total += 40
+            visited.append(url)
+            if kind == "page":
+                return Response(
+                    url, url, 200, b'<script src="/app.js"></script>', {"content-type": "text/html"}
+                )
+            return Response(url, url, 200, b"fetch('/api')", {"content-type": "text/javascript"})
+
+    fetcher = BulkFetcher()
+    engine = Engine(fetcher, max_pages=1, max_files=1)
+    report = await engine.run(targets)
+    assert report["complete"]
+    assert set(targets).issubset(visited)
+    assert len(visited) == 2002
+    assert len(report["endpoints"]) == 1001
+    assert report["summary"]["analyzed_sources"] == 1001
+    assert not engine.cache
+    assert fetcher.max_total == 100
+
+
+async def test_download_cache_does_not_retain_every_source():
+    class SmallFetcher:
+        scope = Scope(["https://example.test"])
+        concurrency = 6
+
+        async def get(self, url, kind):
+            return Response(url, url, 200, b"fetch('/api')")
+
+    engine = Engine(SmallFetcher())
+    for i in range(200):
+        await engine.cached_get(f"https://example.test/{i}.js", "script")
+    assert len(engine.cache) <= 128
+
+
+async def test_report_limit_in_early_batch_does_not_discard_later_target_results():
+    targets = ["https://first.test/app.js", "https://last.test/app.js"]
+
+    class LimitedFetcher:
+        scope = Scope(targets)
+        concurrency = 1
+        max_bytes = 1000
+
+        async def get(self, url, kind):
+            body = f"fetch('{url}/one');fetch('{url}/two')".encode()
+            return Response(url, url, 200, body, {"content-type": "text/javascript"})
+
+    report = await Engine(LimitedFetcher(), max_report_items=1).run(targets)
+    assert {item["url"] for item in report["endpoints"]} == {t + "/one" for t in targets}
+    assert not report["complete"]
+    assert report["summary"]["incomplete"] == 2

@@ -1,5 +1,6 @@
 import ipaddress
 import re
+from contextlib import nullcontext
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -30,8 +31,13 @@ def normalize_url(value: str) -> str:
     return urlunsplit((parts.scheme, authority, parts.path or "/", parts.query, ""))
 
 
-def load_targets(values, lists, stdin, max_targets=1000):
-    seen = set()
+MAX_TARGETS = 100_000
+
+
+def load_targets(values, lists, stdin, max_targets=MAX_TARGETS, limit=None):
+    if limit is not None and not 1 <= limit <= max_targets:
+        raise ValueError(f"target count must be between 1 and {max_targets:,}")
+    seen = dict()
     used_stdin = False
     for value, is_file in [(v, False) for v in values] + [(v, True) for v in lists]:
         if "://" not in value and value != "-":
@@ -48,21 +54,27 @@ def load_targets(values, lists, stdin, max_targets=1000):
                 if used_stdin:
                     raise ValueError("stdin can be read only once")
                 used_stdin = True
-                lines = stdin
+                source = nullcontext(stdin)
             else:
-                lines = Path(value).read_text(encoding="utf-8-sig").splitlines()
+                source = Path(value).open(encoding="utf-8-sig")
         else:
-            lines = [value]
-        for line in lines:
-            if not line.strip() or line.lstrip().startswith("#"):
-                continue
-            url = normalize_url(line)
-            seen.add(url)
-            if len(seen) > max_targets:
-                raise ValueError(f"more than {max_targets} targets supplied")
+            source = nullcontext([value])
+        with source as lines:
+            for line in lines:
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                url = normalize_url(line)
+                seen[url] = None
+                if len(seen) > max_targets:
+                    raise ValueError(
+                        f"more than {max_targets:,} targets supplied; "
+                        "select a subset with --number-of-domains"
+                    )
+                if limit is not None and len(seen) == limit:
+                    return list(seen)
     if not seen:
         raise ValueError("supply a domain, URL, or hostname/URL list")
-    return sorted(seen)
+    return list(seen)
 
 
 class Scope:

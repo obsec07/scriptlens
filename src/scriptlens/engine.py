@@ -25,11 +25,14 @@ class Engine:
         source_maps=True,
         base_url=None,
         max_nodes=250_000,
+        max_report_items=25_000,
     ):
         self.fetcher, self.scope = fetcher, fetcher.scope
         self.max_files, self.max_pages, self.depth = max_files, max_pages, depth
         self.source_maps, self.base_url = source_maps, base_url
         self.max_nodes = max_nodes
+        self.max_report_items = max_report_items
+        self.report_item_offset = 0
         self.redactor = Redactor()
         self.report = {
             "schema_version": 1,
@@ -102,7 +105,12 @@ class Engine:
             return
         self.analyzed += 1
         collections = ("endpoints", "findings", "graphql_operations", "unresolved_requests")
-        remaining = max(0, 25_000 - sum(len(self.report[name]) for name in collections))
+        remaining = max(
+            0,
+            self.max_report_items
+            + self.report_item_offset
+            - sum(len(self.report[name]) for name in collections),
+        )
         for name in collections:
             self.report[name].extend(result[name][:remaining])
             if len(result[name]) > remaining:
@@ -187,6 +195,42 @@ class Engine:
 
     async def run(self, targets):
         self.report["targets"] = targets
+        # Process a bounded group of inputs at a time. A previous group's page,
+        # file or byte budget must not prevent later supplied targets being fetched.
+        max_files, max_pages = self.max_files, self.max_pages
+        max_report_items = self.max_report_items
+        max_total = getattr(self.fetcher, "max_total", None)
+        try:
+            for offset in range(0, len(targets), self.fetcher.concurrency):
+                seeds = targets[offset : offset + self.fetcher.concurrency]
+                self.max_files, self.max_pages = max_files * len(seeds), max_pages * len(seeds)
+                self.max_report_items = max_report_items * len(seeds)
+                self.report_item_offset = sum(
+                    len(self.report[name])
+                    for name in (
+                        "endpoints",
+                        "findings",
+                        "graphql_operations",
+                        "unresolved_requests",
+                    )
+                )
+                if max_total is not None:
+                    self.fetcher.max_total = max_total * len(seeds)
+                    self.fetcher.total = 0
+                self.pages = self.files = self.analysis_attempts = 0
+                self.queue.clear()
+                self.seen.clear()
+                self.cache.clear()
+                await self.run_batch(seeds)
+        finally:
+            self.max_files, self.max_pages = max_files, max_pages
+            self.max_report_items = max_report_items
+            if max_total is not None:
+                self.fetcher.max_total = max_total
+            self.cache.clear()
+        return self.finalize()
+
+    async def run_batch(self, targets):
         for url in targets:
             path = urlsplit(url).path.lower()
             kind = (
@@ -268,14 +312,23 @@ class Engine:
                     )
                     if reference:
                         self.enqueue(urljoin(final, reference), "map", document)
-        return self.finalize()
 
     async def cached_get(self, url, kind):
         # Cache by kind as page and asset scopes differ. Tasks also coalesce in-flight requests.
         key = (url, kind)
         if key not in self.cache:
             self.cache[key] = asyncio.create_task(self.fetcher.get(url, kind))
-        return await self.cache[key]
+        result = await self.cache[key]
+        # Keep cached source bodies bounded even when the input list is very large.
+        completed = [(k, t) for k, t in self.cache.items() if t.done() and not t.cancelled()]
+        size = sum(len(t.result().body) for _, t in completed if t.exception() is None)
+        for cached_key, task in completed:
+            if size <= 64_000_000 and len(self.cache) <= 128:
+                break
+            if task.exception() is None:
+                size -= len(task.result().body)
+            self.cache.pop(cached_key, None)
+        return result
 
     def finalize(self):
         unique = {}

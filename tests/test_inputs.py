@@ -38,6 +38,38 @@ def test_directory_is_not_a_target_list(tmp_path):
         load_targets([str(tmp_path)], [], io.StringIO())
 
 
+def test_accepts_one_hundred_thousand_targets():
+    lines = (f"host{i}.example.test\n" for i in range(100_000))
+    targets = load_targets(["-"], [], lines)
+    assert len(targets) == 100_000
+    assert targets[0] == "https://host0.example.test/"
+    assert targets[-1] == "https://host99999.example.test/"
+
+
+def test_subset_counts_unique_inputs_and_stops_reading_at_requested_count():
+    def lines():
+        yield "z.example.test\n"
+        yield "https://z.example.test/\n"
+        yield "# skipped\n"
+        yield "\n"
+        yield "a.example.test\n"
+        raise AssertionError("must not read beyond the selected subset")
+
+    assert load_targets(["-"], [], lines(), limit=2) == [
+        "https://z.example.test/",
+        "https://a.example.test/",
+    ]
+
+
+def test_over_limit_input_fails_instead_of_silently_truncating():
+    with pytest.raises(ValueError, match="--number-of-domains"):
+        load_targets(["a.test", "b.test", "c.test"], [], io.StringIO(), max_targets=2)
+
+
+def test_subset_larger_than_file_uses_all_available_targets():
+    assert load_targets(["a.test"], [], io.StringIO(), limit=500) == ["https://a.test/"]
+
+
 @pytest.mark.parametrize(
     "value",
     [

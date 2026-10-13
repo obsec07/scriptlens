@@ -139,6 +139,9 @@ def test_parser_limit_can_be_raised_and_failed_parse_not_counted_as_analyzed(tmp
         (["scan", "-d", "example.test"], ["https://example.test/"]),
         (["scan", "-l", "LIST"], ["https://example.test/", "https://other.test/app"]),
         (["example.test"], ["https://example.test/"]),
+        (["-u", "LIST", "--number-of-domains", "1"], ["https://example.test/"]),
+        (["-u", "LIST", "-number-of-domaint", "1"], ["https://example.test/"]),
+        (["-u", "LIST", "-n", "50000"], ["https://example.test/", "https://other.test/app"]),
     ],
 )
 def test_simple_input_flows_save_json(tmp_path, monkeypatch, capsys, arguments, expected):
@@ -187,3 +190,10 @@ def test_missing_list_does_not_start_a_scan(tmp_path, monkeypatch, capsys):
     assert main(["-u", "missing.txt"]) == 2
     assert "input list file does not exist" in capsys.readouterr().err
     assert not (tmp_path / "scriptlens-results").exists()
+
+
+@pytest.mark.parametrize("count", ["0", "-1", "100001", "abc"])
+def test_invalid_target_count_fails_before_scan(count):
+    with pytest.raises(SystemExit) as exc:
+        main(["-u", "example.test", "-n", count])
+    assert exc.value.code == 2
