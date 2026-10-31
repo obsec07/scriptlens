@@ -26,6 +26,30 @@ TOKEN_PATTERNS = (
 )
 
 
+def looks_secret(value):
+    """A stored credential, not a message or label: one token, mixed character types, random enough.
+
+    Error texts ("The password is invalid..."), codes ("wrong-password", "PASSWORD_TOO_SHORT"),
+    URLs, paths and dotted names under a password-like key are not credentials."""
+    value = re.sub(r"^(?:Bearer|Basic|Token)\s+", "", value)
+    if not 12 <= len(value) <= 512 or re.search(r"\s", value) or "{{" in value:
+        return False
+    if "://" in value or value.startswith(("/", "./", "#", ".")):
+        return False
+    parts = re.split(r"[-_.:]", value)
+    if all(re.fullmatch(r"[A-Za-z]{1,20}[0-9]{0,3}|[0-9]{1,4}", part) for part in parts):
+        return False  # words joined by separators: error codes, names, selectors ("oauth2-...")
+    if re.search(r"example|placeholder|your[_ -]|changeme|dummy|test|xxxx|\*\*\*", value, re.I):
+        return False
+    classes = sum(
+        bool(re.search(pattern, value))
+        for pattern in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]")
+    )
+    if classes < 2 or not re.search(r"[0-9]", value):
+        return False
+    return entropy(value) >= (3.5 if len(value) >= 20 else 3.0)
+
+
 def entropy(value):
     return -sum((n / len(value)) * math.log2(n / len(value)) for n in Counter(value).values())
 
@@ -114,12 +138,8 @@ def scan_security(syntax, source, redactor, line_offset=0):
         if key and SENSITIVE.search(key):
             redactor.add(value)
             redactor.values.add(text(node))
-            if (
-                len(value) >= 20
-                and "{{" not in value
-                and entropy(value) >= 3.5
-                and not re.search(r"example|placeholder|your[_ -]|changeme|dummy|test", value, re.I)
-                and not any(pattern.search(value) for _, pattern in TOKEN_PATTERNS)
+            if looks_secret(value) and not any(
+                pattern.search(value) for _, pattern in TOKEN_PATTERNS
             ):
                 add(
                     "hardcoded_credential",

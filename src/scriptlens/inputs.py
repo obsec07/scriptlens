@@ -77,19 +77,143 @@ def load_targets(values, lists, stdin, max_targets=MAX_TARGETS, limit=None):
     return list(seen)
 
 
+# Analytics, advertising, consent, chat and public-library CDNs. Their scripts are the same on
+# every site, so analyzing them only adds endpoints and clues that are not the target's.
+THIRD_PARTY = (
+    "googletagmanager.com",
+    "google-analytics.com",
+    "googleadservices.com",
+    "googlesyndication.com",
+    "doubleclick.net",
+    "gstatic.com",
+    "google.com",
+    "recaptcha.net",
+    "hcaptcha.com",
+    "apis.google.com",
+    "maps.googleapis.com",
+    "ajax.googleapis.com",
+    "facebook.net",
+    "facebook.com",
+    "analytics.tiktok.com",
+    "hotjar.com",
+    "intercom.io",
+    "intercomcdn.com",
+    "segment.com",
+    "segment.io",
+    "mxpnl.com",
+    "amplitude.com",
+    "js.stripe.com",
+    "hs-scripts.com",
+    "hs-analytics.net",
+    "hsforms.net",
+    "hubspot.com",
+    "cookielaw.org",
+    "onetrust.com",
+    "cookiebot.com",
+    "cloudflareinsights.com",
+    "challenges.cloudflare.com",
+    "sentry-cdn.com",
+    "jsdelivr.net",
+    "unpkg.com",
+    "cdnjs.cloudflare.com",
+    "code.jquery.com",
+    "twitter.com",
+    "twimg.com",
+    "ads-twitter.com",
+    "licdn.com",
+    "linkedin.com",
+    "bing.com",
+    "clarity.ms",
+    "newrelic.com",
+    "nr-data.net",
+    "datadoghq-browser-agent.com",
+    "fullstory.com",
+    "optimizely.com",
+    "youtube.com",
+    "vimeo.com",
+    "vimeocdn.com",
+    "onesignal.com",
+    "zdassets.com",
+    "zendesk.com",
+    "livechatinc.com",
+    "crisp.chat",
+    "tawk.to",
+    "drift.com",
+    "driftt.com",
+    "wistia.com",
+    "wistia.net",
+    "branch.io",
+    "heapanalytics.com",
+    "posthog.com",
+    "plausible.io",
+    "mouseflow.com",
+    "quantserve.com",
+    "scorecardresearch.com",
+    "adsrvr.org",
+    "criteo.com",
+    "criteo.net",
+    "taboola.com",
+    "outbrain.com",
+    "pinimg.com",
+    "redditstatic.com",
+    "appleid.cdn-apple.com",
+    "accounts.google.com",
+    "hs-banner.com",
+    "usercentrics.eu",
+    "trustarc.com",
+    "qualtrics.com",
+    "mktoresp.com",
+    "marketo.net",
+    "pardot.com",
+    "adroll.com",
+    "yandex.ru",
+    "mc.yandex.ru",
+    "snapchat.com",
+    "sc-static.net",
+)
+
+
+def third_party(host):
+    return any(host == d or host.endswith("." + d) for d in THIRD_PARTY)
+
+
 class Scope:
-    def __init__(self, targets, domains=(), asset_hosts=()):
+    """Pages: the supplied hosts (plus --scope domains). Scripts and maps referenced by those
+    pages: any public host by default, like a browser loads them, except well-known third-party
+    services. strict=True limits scripts/maps to the supplied hosts and --asset-host as well."""
+
+    def __init__(self, targets, domains=(), asset_hosts=(), strict=False):
         self.hosts = {urlsplit(url).hostname for url in targets}
         self.domains = {urlsplit(normalize_url(d)).hostname for d in domains}
         self.assets = {urlsplit(normalize_url(d)).hostname for d in asset_hosts}
+        self.strict = strict
+
+    def in_scope(self, host):
+        return host in self.hosts or any(host == d or host.endswith("." + d) for d in self.domains)
 
     def allows(self, url, kind="page"):
         try:
             host = urlsplit(normalize_url(url)).hostname
         except (ValueError, UnicodeError):
             return False
-        return (
-            host in self.hosts
-            or any(host == d or host.endswith("." + d) for d in self.domains)
-            or (kind != "page" and host in self.assets)
-        )
+        if self.in_scope(host):
+            return True
+        if kind == "page":
+            return False
+        if host in self.assets:
+            return True
+        return not self.strict and not third_party(host)
+
+    def follow(self, current, target, kind):
+        """A page's redirect between example.com and www.example.com (either way) keeps the site
+        in scope; the new host is then treated as supplied."""
+        old, new = urlsplit(current).hostname, urlsplit(target).hostname
+        if (
+            kind == "page"
+            and old in self.hosts
+            and new
+            and (new == "www." + old or old == "www." + new)
+        ):
+            self.hosts.add(new)
+            return True
+        return False

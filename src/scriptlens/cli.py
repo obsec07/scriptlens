@@ -105,7 +105,23 @@ def parser(advanced=False):
         help="hostname/URL list (repeatable)",
     )
     scan.add_argument(
+        "--dynamic",
+        action="store_true",
+        help="also load each page in headless Chromium: real requests, runtime scripts, DOM XSS",
+    )
+    scan.add_argument(
+        "--dynamic-wait",
+        type=positive_float,
+        default=4,
+        help="seconds to wait for a page to settle in dynamic mode (default 4)",
+    )
+    scan.add_argument(
         "--scope", action="append", default=[], help="also allow this domain and its subdomains"
+    )
+    scan.add_argument(
+        "--strict-scope",
+        action="store_true",
+        help="load scripts/maps only from supplied hosts and --asset-host (no CDN scripts)",
     )
     scan.add_argument(
         "--asset-host",
@@ -206,7 +222,15 @@ def parser(advanced=False):
             "-v", "--verbose", action="store_true", help="show skipped/incomplete source details"
         )
         if not advanced:
-            basic = {"help", "help_all", "extra_targets", "output", "files", "number_of_domains"}
+            basic = {
+                "help",
+                "help_all",
+                "extra_targets",
+                "output",
+                "files",
+                "number_of_domains",
+                "dynamic",
+            }
             for action in command._actions:
                 if action.dest not in basic:
                     action.help = argparse.SUPPRESS
@@ -231,36 +255,92 @@ def label(value, color, args):
     return f"\033[{color}m{token}\033[0m" if colored and color else token
 
 
+def where(evidence):
+    """Short source location: file name (or script URL) and line, plus the column on long
+    (minified) lines."""
+    source = str(evidence.get("source", ""))
+    if source == "runtime":
+        return "runtime"
+    if not source.startswith(("http://", "https://")):
+        source = Path(source.split("#", 1)[0]).name + (
+            "#" + source.split("#", 1)[1] if "#" in source else ""
+        )
+    line, column = evidence.get("line") or 0, evidence.get("column") or 0
+    if not line:
+        return plain(source)
+    return plain(f"{source}:{line}" + (f":{column}" if column > 120 else ""))
+
+
+TOKEN_NAMES = {
+    "github_token": "GitHub token",
+    "stripe_secret_key": "Stripe secret key",
+    "private_key": "private key",
+}
+
+
+def finding_line(item, args):
+    status, rule = item.get("status"), item["rule"]
+    if status == "confirmed":
+        marker = label("XSS", "1;31", args)
+    elif rule in TOKEN_NAMES or rule == "hardcoded_credential":
+        marker = label("KEY", "33", args)
+    else:
+        marker = label("REVIEW", "35", args)
+    if rule in TOKEN_NAMES:
+        title = f"{TOKEN_NAMES[rule]} in the code"
+    elif rule == "hardcoded_credential":
+        name = item.get("field")
+        title = (
+            f"hardcoded value for '{plain(name)}'"
+            if name and "{{" not in str(name)
+            else "hardcoded credential-like value"
+        )
+    else:
+        title = plain(item["title"])
+    return f"{marker} {title}  {where(item['evidence'])}"
+
+
 def print_report(report, path, args):
     remaining = args.max_output
-    for item in sorted(report["findings"], key=lambda x: x["priority"] != "high"):
+    rank = {"confirmed": 0}
+    findings = [
+        f
+        for f in report["findings"]
+        if f["priority"] != "low" and not f.get("superseded_by_runtime")
+    ]
+    findings.sort(key=lambda f: (rank.get(f.get("status"), 1), f["priority"] != "high"))
+    lines = Counter(finding_line(item, args) for item in findings)
+    for text, count in lines.items():
         if remaining <= 0:
             break
-        marker = label(
-            "KEY" if item["priority"] == "high" else "REVIEW",
-            "33" if item["priority"] == "high" else "35",
-            args,
-        )
-        evidence = item["evidence"]
-        print(f"{marker} {plain(item['title'])} - {plain(evidence['source'])}:{evidence['line']}")
+        print(text + (f"  (x{count})" if count > 1 else ""))
         remaining -= 1
+    shown = {}
     for item in report["endpoints"]:
+        key = (item["method"], item["url"] or item["url_template"])
+        shown.setdefault(key, []).append(item)
+    for (method, url), items in shown.items():
         if remaining <= 0:
             break
         marker = label(
-            item["method"] or "CHECK",
-            "36" if item["method"] in {"POST", "PUT", "PATCH", "DELETE"} else "",
-            args,
+            method or "CHECK", "36" if method in {"POST", "PUT", "PATCH", "DELETE"} else "", args
         )
-        body = item["body"]["value"]
-        fields = (
-            "; body: " + ", ".join(plain(k) for k in list(body)[:12])
-            if isinstance(body, dict) and body
-            else ""
+        body = next(
+            (i["body"]["value"] for i in items if isinstance(i["body"]["value"], dict)), None
         )
-        print(f"{marker} {plain(item['url'] or item['url_template'])}{fields}")
-        if args.show_curl and item["curl"]:
-            print("  " + plain(item["curl"]))
+        fields = "  body: " + ", ".join(plain(k) for k in list(body)[:12]) if body else ""
+        tags = []
+        if any(i.get("execution") == "blocked" or i.get("blocked_at_runtime") for i in items):
+            tags.append("seen at runtime, blocked")
+        elif any(i.get("observed_at_runtime") for i in items):
+            tags.append("seen at runtime")
+        if len(items) > 1:
+            tags.append(f"{len(items)} variants")
+        print(f"{marker} {plain(url)}{fields}" + (f"  ({', '.join(tags)})" if tags else ""))
+        if args.show_curl:
+            for item in items:
+                if item["curl"]:
+                    print("  " + plain(item["curl"]))
         remaining -= 1
     if args.verbose:
         for item in report["diagnostics"]:
@@ -269,10 +349,24 @@ def print_report(report, path, args):
                 print("  " + plain(item["hint"]))
     if not args.raw:
         summary = report["summary"]
-        print(
-            f"Done: {summary['analyzed_sources']} sources, {summary['endpoints']} endpoints, "
-            f"{summary['review_items']} review items, {summary['incomplete']} incomplete."
-        )
+
+        def count(n, word):
+            return f"{n} {word}{'' if n == 1 else 's'}"
+
+        parts = [
+            count(summary["analyzed_sources"], "script"),
+            count(summary["endpoints"], "endpoint")
+            + (
+                f" ({summary['seen_at_runtime']} seen at runtime)"
+                if summary.get("seen_at_runtime")
+                else ""
+            ),
+            count(summary["review_items"], "review item"),
+        ]
+        if summary.get("confirmed"):
+            parts.append(f"{summary['confirmed']} confirmed XSS")
+        parts.append(f"{summary['incomplete']} incomplete")
+        print("Done: " + ", ".join(parts) + ".")
         if summary["incomplete"] and not args.verbose:
             problems = Counter(
                 (d["reason"], d.get("hint", ""))
@@ -284,7 +378,7 @@ def print_report(report, path, args):
                 if hint:
                     print("  " + plain(hint))
             print("Details: diagnostics in the JSON report, or rerun with -v.")
-        if summary["review_items"] + summary["endpoints"] > args.max_output:
+        if len(lines) + len(shown) > args.max_output:
             print("More results are in the JSON report.")
         print("Saved: " + plain(path))
 
@@ -296,7 +390,21 @@ def run(args):
         targets = load_targets(
             args.targets + args.extra_targets, args.lists, sys.stdin, limit=args.number_of_domains
         )
-        scope = Scope(targets, args.scope, args.asset_host)
+        scope = Scope(targets, args.scope, args.asset_host, strict=args.strict_scope)
+        runtime = None
+        if args.dynamic:
+            from .dynamic import INSTALL_HINT, Runtime, available
+
+            if not available():
+                raise ValueError(INSTALL_HINT)
+            runtime = Runtime(
+                scope,
+                timeout=args.timeout,
+                wait=args.dynamic_wait,
+                insecure=args.insecure,
+                allow_private=args.allow_private,
+                max_bytes=args.max_bytes,
+            )
         fetcher = Fetcher(
             scope,
             timeout=args.timeout,
@@ -315,6 +423,7 @@ def run(args):
             source_maps=not args.no_source_maps,
             base_url=args.base_url,
             max_nodes=args.max_nodes,
+            runtime=runtime,
         )
     else:
         for path in args.files:
@@ -340,7 +449,10 @@ def run(args):
 
                 async def perform():
                     async with fetcher:
-                        return await engine.run(targets)
+                        if engine.runtime is None:
+                            return await engine.run(targets)
+                        async with engine.runtime:
+                            return await engine.run(targets)
 
                 report = asyncio.run(perform())
             else:
@@ -385,6 +497,7 @@ def run(args):
             "base_url": args.base_url,
             "secrets_redacted": True,
             "mode": args.command,
+            "dynamic": bool(getattr(args, "dynamic", False)),
             "number_of_domains": getattr(args, "number_of_domains", None),
             "max_pages": getattr(args, "max_pages", None),
             "scan_budget_scope": "per input, pooled within each batch"

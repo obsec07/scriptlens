@@ -333,3 +333,43 @@ async def test_report_limit_in_early_batch_does_not_discard_later_target_results
     assert {item["url"] for item in report["endpoints"]} == {t + "/one" for t in targets}
     assert not report["complete"]
     assert report["summary"]["incomplete"] == 2
+
+
+async def test_extra_links_third_party_scripts_and_small_parse_gaps_are_not_failures():
+    class FakeFetcher:
+        scope = Scope(["https://app.test"])
+        concurrency = 3
+        max_bytes = 1_000_000
+
+        async def get(self, url, kind):
+            if kind == "page":
+                links = "".join(f'<a href="/p{i}">p</a>' for i in range(30))
+                return Response(
+                    url,
+                    url,
+                    200,
+                    (
+                        '<script src="https://cdn.app-assets.test/app.js"></script>'
+                        '<script src="https://www.googletagmanager.com/gtm.js"></script>' + links
+                    ).encode(),
+                    {"content-type": "text/html"},
+                )
+            # one unparsable construct inside an otherwise fine, large bundle
+            code = "fetch('/api/a');" + "var x=1;" * 2000 + "a = String.raw`\\\\u{zz`; ]]] ;"
+            return Response(url, url, 200, code.encode(), {"content-type": "text/javascript"})
+
+    report = await Engine(FakeFetcher(), max_pages=2).run(["https://app.test/"])
+    reasons = json.dumps(report["diagnostics"])
+    assert "third-party service script" in reasons
+    assert "linked page(s) not crawled" in reasons
+    assert "small syntax region" in reasons
+    assert report["complete"] is True
+    assert {e["url"] for e in report["endpoints"]} == {"https://app.test/api/a"}
+    assert report["summary"]["downloads"] >= 3
+
+
+def test_badly_broken_source_is_still_incomplete():
+    engine = Engine(Fetcher(Scope([])), source_maps=False)
+    engine.process_code("function broken( { fetch('/x'", "app.js")
+    report = engine.finalize()
+    assert report["complete"] is False

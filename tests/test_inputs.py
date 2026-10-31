@@ -87,7 +87,7 @@ def test_invalid_input(value):
 
 
 def test_scope_does_not_leak_to_suffix_lookalike_or_cdn_pages():
-    scope = Scope(["https://app.example.test/"], ["example.org"], ["cdn.example.net"])
+    scope = Scope(["https://app.example.test/"], ["example.org"], ["cdn.example.net"], strict=True)
     assert scope.allows("https://sub.example.org/a.js", "script")
     assert not scope.allows("https://example.org.evil.test/a.js", "script")
     assert scope.allows("https://cdn.example.net/a.js", "script")
@@ -99,3 +99,22 @@ def test_scope_does_not_leak_to_suffix_lookalike_or_cdn_pages():
 )
 def test_private_multicast_and_metadata_addresses_are_not_public(address):
     assert not public_ip(address)
+
+
+def test_default_scope_loads_a_pages_cdn_scripts_but_not_third_party_or_pages():
+    scope = Scope(["https://app.example.test/"])
+    assert scope.allows("https://assets.example-cdn.net/app.js", "script")
+    assert scope.allows("https://d111.cloudfront.net/app.js.map", "map")
+    assert not scope.allows("https://www.googletagmanager.com/gtm.js", "script")
+    assert not scope.allows("https://static.hotjar.com/c/hotjar.js", "script")
+    assert not scope.allows("https://assets.example-cdn.net/page", "page")
+    assert not scope.allows("https://evil.test/", "page")
+
+
+def test_www_redirect_keeps_the_site_in_scope_but_nothing_else():
+    scope = Scope(["https://example.test/"])
+    assert scope.follow("https://example.test/", "https://www.example.test/", "page")
+    assert scope.allows("https://www.example.test/next", "page")
+    assert not scope.follow("https://example.test/", "https://evil.test/", "page")
+    assert not scope.follow("https://example.test/", "https://www.example.test/", "script")
+    assert not scope.allows("https://evil.test/", "page")

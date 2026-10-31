@@ -182,7 +182,9 @@ class Fetcher:
                         location = response.headers.get("Location")
                         if not location:
                             raise ValueError("redirect has no destination")
-                        current = normalize_url(urljoin(current, location))
+                        target = normalize_url(urljoin(current, location))
+                        self.scope.follow(current, target, kind)
+                        current = target
                         continue
                     if response.status != 200:
                         raise FetchError(

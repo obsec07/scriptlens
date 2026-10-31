@@ -63,3 +63,34 @@ def test_runtime_token_stays_a_placeholder():
     result = review("fetch('/api',{headers:{Authorization:token}})")
     assert result["endpoints"][0]["headers"]["Authorization"] == "{{token}}"
     assert result["findings"] == []
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        # Firebase Auth error tables: messages and codes under password-like keys
+        '{"wrong-password":"The password is invalid or the user does not have a password."}',
+        '{"weak-password":"The password must be 6 characters long or more."}',
+        "{PASSWORD_DOES_NOT_MEET_REQUIREMENTS:'password-does-not-meet-requirements'}",
+        "{access_token:'oauth2-access-token-cookie-name'}",
+        "{passwordField:'input.password-confirmation'}",
+        "{client_secret:'https://login.example.com/oauth/secret'}",
+        "{authorization:'Bearer {{token}}'}",
+    ],
+)
+def test_messages_codes_and_names_under_secret_keys_are_not_credentials(code):
+    assert review("const x=" + code)["findings"] == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Xk9#mQ2$vL7pW4zR",
+        "q8Z3vN1bX6mK0pL5sT9wE2rY7uI4oA",
+        "Bearer eyJhbGciOiJIUzI1NiJ9.e30.Zm9vYmFyMTIz",
+    ],
+)
+def test_real_looking_secrets_are_still_found_and_redacted(value):
+    result = review("const config={client_secret:" + json.dumps(value) + "}")
+    assert [f["rule"] for f in result["findings"]] == ["hardcoded_credential"]
+    assert value not in json.dumps(result)
