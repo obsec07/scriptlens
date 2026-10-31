@@ -197,3 +197,36 @@ def test_invalid_target_count_fails_before_scan(count):
     with pytest.raises(SystemExit) as exc:
         main(["-u", "example.test", "-n", count])
     assert exc.value.code == 2
+
+
+def test_terminal_output_is_short_grouped_and_plural_aware(tmp_path, capsys):
+    source = tmp_path / "app.js"
+    source.write_text(
+        "fetch('/api/a');\nfetch('/api/a');\nconst x=location.hash; document.body.innerHTML=x;\n"
+    )
+    assert (
+        main(
+            [
+                "analyze",
+                str(source),
+                "--base-url",
+                "https://app.test/",
+                "-o",
+                str(tmp_path / "r.json"),
+            ]
+        )
+        == 0
+    )
+    console = capsys.readouterr().out.splitlines()
+    assert console[0].startswith("[REVIEW] ") and console[0].endswith("app.js:3")
+    assert str(tmp_path) not in console[0]  # file name, not the full local path
+    assert [line for line in console if line.startswith("[GET]")] == [
+        "[GET] https://app.test/api/a"
+    ]
+    assert "1 script, 1 endpoint, 1 review item, 0 incomplete." in console[-2]
+
+
+def test_dynamic_needs_playwright_and_says_how(monkeypatch, capsys):
+    monkeypatch.setattr("scriptlens.dynamic.available", lambda: False)
+    assert main(["-u", "https://app.test/", "--dynamic"]) == 2
+    assert "pip install 'scriptlens[dynamic]'" in capsys.readouterr().err

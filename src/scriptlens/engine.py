@@ -9,7 +9,7 @@ from urllib.parse import unquote_to_bytes, urljoin, urlsplit
 from . import __version__
 from .analyzer import analyze
 from .discovery import Page
-from .inputs import normalize_url
+from .inputs import normalize_url, third_party
 from .requests import curl_example
 from .security import Redactor
 
@@ -26,6 +26,7 @@ class Engine:
         base_url=None,
         max_nodes=250_000,
         max_report_items=25_000,
+        runtime=None,
     ):
         self.fetcher, self.scope = fetcher, fetcher.scope
         self.max_files, self.max_pages, self.depth = max_files, max_pages, depth
@@ -33,6 +34,8 @@ class Engine:
         self.max_nodes = max_nodes
         self.max_report_items = max_report_items
         self.report_item_offset = 0
+        self.runtime = runtime
+        self.fetched = set()
         self.redactor = Redactor()
         self.report = {
             "schema_version": 1,
@@ -45,6 +48,7 @@ class Engine:
             "graphql_operations": [],
             "unresolved_requests": [],
             "sources": [],
+            "runtime": [],
             "diagnostics": [],
             "limitations": [
                 "Static analysis; no JavaScript, extracted API request or curl example "
@@ -57,8 +61,16 @@ class Engine:
             ],
         }
         self.queue, self.seen, self.cache = deque(), set(), {}
+        if runtime is not None:
+            self.report["limitations"][0] = (
+                "Static analysis plus a headless-browser load of each supplied page (--dynamic). "
+                "Extracted requests and curl examples are never sent; in the browser only the "
+                "page's own GET/HEAD/OPTIONS requests run, other methods are recorded and blocked."
+            )
         self.pages = self.files = self.analyzed = 0
         self.analysis_attempts = 0
+        self.downloads = 0
+        self.links_not_crawled = 0
 
     def diagnostic(self, url, reason, category="incomplete", *, code=None, hint=None):
         item = {"source": url, "category": category, "reason": reason}
@@ -79,9 +91,14 @@ class Engine:
             return
         self.seen.add(key)
         if not self.scope.allows(url, kind):
-            self.diagnostic(
-                url, "outside scope; add an authorized --asset-host or --scope", "skipped"
-            )
+            host = urlsplit(url).hostname or ""
+            if kind != "page" and third_party(host):
+                reason = "third-party service script (analytics, ads, consent or public CDN)"
+            elif kind == "page":
+                reason = "page outside scope; add --scope to crawl it"
+            else:
+                reason = "outside scope; add an authorized --asset-host or --scope"
+            self.diagnostic(url, reason, "skipped")
             return
         if len(self.queue) >= (self.max_files + self.max_pages) * 4:
             if not any(
@@ -117,9 +134,21 @@ class Engine:
                 self.diagnostic(source, "report item limit reached; extraction is partial")
             remaining = max(0, remaining - len(result[name]))
         if result["parse_errors"]:
-            self.diagnostic(
-                source, "syntax could not be fully parsed; extraction may be incomplete"
-            )
+            errors, size = len(result["parse_errors"]), sum(result["parse_errors"])
+            # A grammar gap on one construct leaves a small ERROR region; everything around it
+            # is still parsed and analyzed. Only larger damage makes the source incomplete.
+            total = len(code) if isinstance(code, bytes) else len(code.encode("utf-8", "replace"))
+            if errors <= 20 and size <= total // 100:
+                self.diagnostic(
+                    source,
+                    f"{errors} small syntax region(s) ({size:,} bytes) could not be parsed; "
+                    "the rest was analyzed",
+                    "skipped",
+                )
+            else:
+                self.diagnostic(
+                    source, "syntax could not be fully parsed; extraction may be incomplete"
+                )
         if not discover:
             return
         for dependency in result["dependencies"]:
@@ -218,10 +247,16 @@ class Engine:
                     self.fetcher.max_total = max_total * len(seeds)
                     self.fetcher.total = 0
                 self.pages = self.files = self.analysis_attempts = 0
+                if self.links_not_crawled:
+                    self.note_links()
                 self.queue.clear()
                 self.seen.clear()
+                self.fetched.clear()
                 self.cache.clear()
                 await self.run_batch(seeds)
+                if self.runtime:
+                    await self.run_dynamic(seeds)
+            self.note_links()
         finally:
             self.max_files, self.max_pages = max_files, max_pages
             self.max_report_items = max_report_items
@@ -230,16 +265,16 @@ class Engine:
             self.cache.clear()
         return self.finalize()
 
+    @staticmethod
+    def target_kind(url):
+        path = urlsplit(url).path.lower()
+        if path.endswith((".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")):
+            return "script"
+        return "map" if path.endswith(".map") else "page"
+
     async def run_batch(self, targets):
         for url in targets:
-            path = urlsplit(url).path.lower()
-            kind = (
-                "script"
-                if path.endswith((".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"))
-                else "map"
-                if path.endswith(".map")
-                else "page"
-            )
+            kind = self.target_kind(url)
             self.enqueue(url, kind, self.base_url if kind != "page" else None)
         while self.queue:
             batch = []
@@ -248,7 +283,8 @@ class Engine:
                 url, kind, document, depth = item
                 if kind == "page":
                     if self.pages >= self.max_pages:
-                        self.diagnostic(url, "page limit reached")
+                        # Extra links are not part of the supplied input; count, don't fail.
+                        self.links_not_crawled += 1
                         continue
                     self.pages += 1
                 else:
@@ -260,10 +296,12 @@ class Engine:
             responses = await asyncio.gather(
                 *(self.cached_get(url, kind) for url, kind, _, _ in batch)
             )
+            self.downloads += len(batch)
             for (url, kind, document, depth), response in zip(batch, responses, strict=True):
                 self.report["sources"].append(
                     {**response.metadata(), "kind": kind, "document_url": document}
                 )
+                self.fetched.update({url, response.final_url})
                 if response.error:
                     self.diagnostic(
                         url, response.error, code=response.error_code, hint=response.hint
@@ -313,6 +351,61 @@ class Engine:
                     if reference:
                         self.enqueue(urljoin(final, reference), "map", document)
 
+    async def run_dynamic(self, targets):
+        pages = [url for url in targets if self.target_kind(url) == "page"]
+        results = await asyncio.gather(*(self.runtime.observe(url) for url in pages))
+        for result in results:
+            self.apply_runtime(result)
+
+    def apply_runtime(self, result):
+        from .dynamic import endpoint, sink_findings
+
+        page = result.get("final_url") or result["page"]
+        self.report["runtime"].append(
+            {
+                "page": page,
+                "requests_seen": sum(not r["blocked"] for r in result["requests"]),
+                "requests_blocked": sum(r["blocked"] for r in result["requests"]),
+                "runtime_scripts": len(result["scripts"]),
+                "marker_reached_sinks": len(result["sinks"]),
+                "errors": result["errors"],
+            }
+        )
+        for error in result["errors"]:
+            self.diagnostic(page, "dynamic analysis: " + error)
+        for url, body in result["scripts"]:
+            # Scripts the static crawl already analyzed are not counted twice.
+            if url in self.fetched:
+                continue
+            self.fetched.add(url)
+            if self.files >= self.max_files:
+                self.diagnostic(url, "script/source-map file limit reached")
+                continue
+            self.files += 1
+            self.downloads += 1
+            self.report["sources"].append(
+                {
+                    "url": url,
+                    "kind": "runtime_script",
+                    "document_url": page,
+                    "bytes": len(body),
+                    "sha256": hashlib.sha256(body).hexdigest(),
+                }
+            )
+            self.process_code(body.decode("utf-8-sig", "replace"), url, page, discover=False)
+        self.report["endpoints"].extend(endpoint(r, page) for r in result["requests"])
+        self.report["findings"].extend(sink_findings(result))
+
+    def note_links(self):
+        if self.links_not_crawled:
+            self.diagnostic(
+                "pages",
+                f"{self.links_not_crawled} linked page(s) not crawled (page budget; "
+                "raise --max-pages to include them)",
+                "skipped",
+            )
+            self.links_not_crawled = 0
+
     async def cached_get(self, url, kind):
         # Cache by kind as page and asset scopes differ. Tasks also coalesce in-flight requests.
         key = (url, kind)
@@ -330,7 +423,46 @@ class Engine:
             self.cache.pop(cached_key, None)
         return result
 
+    def merge_runtime(self):
+        """A request seen at runtime that static analysis also found marks that endpoint as
+        observed instead of appearing twice."""
+        static = {}
+        for item in self.report["endpoints"]:
+            if (
+                item["library"] != "browser"
+                and item["url"]
+                and "{{" not in item["url"].split("?")[0]
+            ):
+                static.setdefault((item["method"], item["url"].split("?")[0]), []).append(item)
+        kept = []
+        for item in self.report["endpoints"]:
+            matches = item["library"] == "browser" and static.get(
+                (item["method"], item["url"].split("?")[0])
+            )
+            if not matches:
+                kept.append(item)
+                continue
+            # Every static copy (the same script can be analyzed for several pages) gets the
+            # same mark, so identical records still merge below.
+            for match in matches:
+                match["observed_at_runtime"] = True
+                if item.get("execution") == "blocked":
+                    match["blocked_at_runtime"] = True
+                match["evidence"].extend(e for e in item["evidence"] if e not in match["evidence"])
+        self.report["endpoints"] = kept
+        # A static review clue on the same line as a runtime observation is replaced by it.
+        observed = {
+            (f["evidence"]["source"], f["evidence"]["line"])
+            for f in self.report["findings"]
+            if f.get("observed") == "runtime"
+        }
+        for finding in self.report["findings"]:
+            location = (finding["evidence"]["source"], finding["evidence"]["line"])
+            if finding.get("observed") != "runtime" and location in observed:
+                finding["superseded_by_runtime"] = True
+
     def finalize(self):
+        self.merge_runtime()
         unique = {}
         for item in self.report["endpoints"]:
             key = json.dumps({k: v for k, v in item.items() if k != "evidence"}, sort_keys=True)
@@ -354,10 +486,15 @@ class Engine:
             self.report[collection] = values
         self.report["summary"] = {
             "targets": len(self.report["targets"]),
-            "downloads": len(self.cache),
+            "downloads": self.downloads,
             "analyzed_sources": self.analyzed,
             "endpoints": len(unique),
-            "review_items": len(self.report["findings"]),
+            "review_items": sum(
+                f["priority"] != "low" and not f.get("superseded_by_runtime")
+                for f in self.report["findings"]
+            ),
+            "confirmed": sum(f.get("status") == "confirmed" for f in self.report["findings"]),
+            "seen_at_runtime": sum(bool(e.get("observed_at_runtime")) for e in unique.values()),
             "unresolved_requests": len(self.report["unresolved_requests"]),
             "incomplete": sum(d["category"] == "incomplete" for d in self.report["diagnostics"]),
         }

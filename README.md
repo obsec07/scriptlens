@@ -10,7 +10,8 @@ failure rows. Help is always plain. Only result labels can have color.
 
 ## Install
 
-Requires Python 3.11 or newer. No Node.js or browser installation is needed.
+Requires Python 3.11 or newer. No Node.js or browser is needed, except for the optional
+`--dynamic` mode (see [Dynamic analysis](#dynamic-analysis)).
 
 ```bash
 git clone https://github.com/obsec07/scriptlens.git
@@ -124,10 +125,13 @@ TLS certificates are verified by default; `-k`, `--insecure`, and
 
 ```text
 [GET] https://demo.example.test/api/orders/{{orderId}}
-[POST] https://demo.example.test/api/v2/users; body: email, role
-Done: 4 sources, 2 endpoints, 0 review items, 0 incomplete.
+[POST] https://demo.example.test/api/v2/users  body: email, role
+Done: 4 scripts, 2 endpoints, 0 review items, 0 incomplete.
 Saved: scriptlens-results/20261006-120000-a1b2c3.json
 ```
+
+One line per finding or endpoint: findings show the file (or script URL) and line,
+identical lines are grouped, and an endpoint found several times is printed once.
 
 Every run saves JSON, including runs with incomplete downloads or syntax errors.
 The default location is a unique file under `scriptlens-results/`. Use `-o FILE`
@@ -161,6 +165,45 @@ credentials and sensitive request values are redacted by default; credential
 findings include a fingerprint for correlation. Raw downloaded source is not
 written to disk. Redaction is best-effort: unusual formats can escape detection.
 
+## Dynamic analysis
+
+`--dynamic` also opens each supplied page in headless Chromium:
+
+```bash
+python -m pip install '.[dynamic]'
+python -m playwright install chromium
+scriptlens -u https://app.example.com/ --dynamic
+```
+
+```text
+[XSS] query parameter 'q' reaches innerHTML unescaped; injected element present in the page  https://cdn.example.net/main.js:6
+[POST] https://app.example.com/api/cart  body: sku, qty  (seen at runtime, blocked)
+[GET] https://app.example.com/api/reports/monthly?year=2026  (seen at runtime)
+Done: 5 scripts, 3 endpoints (3 seen at runtime), 1 review item, 1 confirmed XSS, 0 incomplete.
+```
+
+What it adds:
+
+- **Real requests.** Fetch/XHR/beacon/WebSocket requests the page makes by itself are
+  recorded with method, URL, headers and body. GET, HEAD and OPTIONS run as in a normal
+  visit; **POST, PUT, PATCH and DELETE are recorded and blocked, never sent**.
+- **Runtime scripts.** Scripts loaded while the page runs (lazy webpack chunks, computed
+  `import()` names, loaders) are analyzed too; static discovery cannot see them.
+- **Confirmed DOM XSS, without guesses.** A harmless marker
+  (`<random token><slx onsl=1>`) is placed in the URL fragment, in a few common query
+  parameters that the URL does not already use, and in `window.name`. HTML and code
+  sinks (`innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `srcdoc`,
+  `createContextualFragment`, string `setTimeout`) are watched. `[XSS]` is printed only
+  when that marker reached an HTML sink unescaped **and** the injected element exists in
+  the page afterwards. Encoded values are kept in JSON as low-priority notes; static review
+  clues on a line the browser checked are replaced by the runtime result.
+
+Dynamic mode uses no cookies, logins or clicks, does not navigate outside the scope,
+blocks private addresses unless `--allow-private` is given, and skips third-party
+services. `--dynamic-wait` sets how long a page may settle (default 4 seconds). It loads
+each page twice (plain, then with the marker), so use it on the pages that matter
+rather than on very large lists.
+
 ## Coverage
 
 | Area | Supported evidence |
@@ -174,6 +217,7 @@ written to disk. Redaction is best-effort: unusual formats can escape detection.
 | Credential clues | GitHub/Stripe secret-token formats, private-key blocks, sensitive hardcoded values with length/entropy controls; no credential validation |
 | Browser security | Short local flows from URL/referrer/message data to HTML, eval, redirects or Fetch URLs; sensitive storage writes; sensitive fields in wildcard postMessage calls |
 | Endpoint review | Suggestions for object/tenant authorization, admin access and state-changing requests, based on the observed request shape |
+| Runtime (`--dynamic`) | Requests the page makes, runtime-loaded scripts, URL-to-sink flows observed in headless Chromium |
 
 Security findings are **review clues**, never confirmed vulnerabilities. Priority
 means review order, not proven impact. Ordinary Firebase client configuration,
@@ -208,17 +252,23 @@ colors and the summary. Help, saved JSON and status text are always plain.
 | `POST`, `PUT`, `PATCH`, `DELETE` | Observed state-changing method | Cyan |
 | `KEY` | Credential-like value needing review | Yellow |
 | `REVIEW` | Browser security clue needing review | Magenta |
+| `XSS` | DOM XSS observed in the browser (`--dynamic`): marker element created | Bold red |
 
-There is no automatic critical/high vulnerability label. Unknown URL calls stay
+Static analysis never claims a vulnerability; only `--dynamic` can print `XSS`, and only
+for an observed flow. Unknown URL calls stay
 in `unresolved_requests`, and incomplete fetches stay in `diagnostics` rather
 than becoming noisy per-host findings.
 
 ## Boundaries and limits
 
-Only supplied hostnames are fetched by default. `--scope DOMAIN` adds that domain
-and its subdomains. `--asset-host HOST` adds one exact hostname for scripts/maps,
-not general page crawling. Out-of-scope redirects are stopped before the next
-request. Private and loopback destinations are blocked unless `--allow-private`
+Pages are fetched only from the supplied hostnames; a redirect between `example.com`
+and `www.example.com` is followed. `--scope DOMAIN` adds that domain and its
+subdomains. Scripts and source maps that those pages reference are loaded from any
+public host, the way a browser loads a site's CDN, except well-known third-party
+services (analytics, ads, consent, chat, public library CDNs), which are skipped and
+listed in `diagnostics`. `--strict-scope` limits scripts/maps to the supplied hosts
+and `--asset-host HOST` entries. Other out-of-scope redirects are stopped before the
+next request. Private and loopback destinations are blocked unless `--allow-private`
 is supplied for an authorized lab. DNS resolution is checked in the connector,
 so the address actually used must pass the check.
 
@@ -235,6 +285,10 @@ Use the corresponding `--max-pages`, `--depth`, `--max-files`, `--concurrency`,
 source; `--max-nodes` adjusts this for both commands, at the cost of more memory.
 Embedded source maps, analysis units and report items also have
 bounds. Hitting a bound is recorded as incomplete, not silently reported as success.
+Two things are deliberately not incomplete: linked pages beyond the page budget (the
+supplied pages were all fetched; one `skipped` note gives the count), and a few small
+regions the parser cannot read inside a large bundle (at most 20 regions and 1% of the
+file; the rest is analyzed and the note says how much was skipped).
 Extraction has a budget of 25,000 items per input across endpoints, findings,
 GraphQL operations and unresolved requests, also pooled within each batch.
 Hitting that budget marks the affected extraction incomplete without preventing
@@ -244,7 +298,7 @@ disk space; the input limit is not a guarantee of a particular run time or RAM u
 Repeated assets may be analyzed in multiple page contexts. Downloads are reused
 within a batch while cached; the cache retains at most 128 completed entries and
 64 MB of bodies, and is released between batches. Evicted assets may be downloaded
-again. This is a static collector: it does not run a browser, reuse
+again. Without `--dynamic` it does not run a browser. It never reuses
 cookies, read `.netrc`, use environment proxies, guess undeclared `.map` paths,
 validate secrets, or send authentication/exploit requests. Unexpected compressed
 responses are skipped to keep download-memory limits enforceable.

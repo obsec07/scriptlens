@@ -55,8 +55,20 @@ def analyze(code, source, redactor, document_url=None, line_offset=0, *, max_nod
         "dependencies": list(dict.fromkeys(dependencies)),
         "source_maps": list(dict.fromkeys(maps)),
         "graphql_operations": graphql,
-        "parse_errors": syntax.tree.root_node.has_error,
+        "parse_errors": syntax_errors(syntax.tree.root_node),
     }
+
+
+def syntax_errors(root):
+    """Byte sizes of the regions Tree-sitter could not parse (ERROR or missing nodes)."""
+    spans, stack = [], [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "ERROR" or node.is_missing:
+            spans.append(max(1, node.end_byte - node.start_byte))
+        elif node.has_error:
+            stack.extend(node.children)
+    return spans
 
 
 def graphql_record(query, location, endpoint=None):

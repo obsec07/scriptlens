@@ -23,3 +23,13 @@ jobs:
       - run: python -m pip install --force-reinstall --no-deps dist/*.whl
       - run: scriptlens --version
       - run: scriptlens analyze tests/fixtures/demo.js --base-url https://example.test/ -o /tmp/demo.json --raw
+  dynamic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -e '.[dev,dynamic]'
+      - run: python -m playwright install --with-deps chromium
+      - run: pytest -q tests/test_dynamic.py

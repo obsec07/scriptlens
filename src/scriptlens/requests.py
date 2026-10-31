@@ -133,6 +133,17 @@ def curl_example(request):
     return shlex.join(command)
 
 
+def review_checks(path, method):
+    checks = []
+    if re.search(r"/(?:admin|internal|manage)(?:/|$)", path, re.I):
+        checks.append("Check server-side role enforcement using authorized accounts")
+    if re.search(r"/(?:users?|accounts?|tenants?|orders?|files?)(?:/|$)|\{\{", path, re.I):
+        checks.append("Check object and tenant access with two authorized accounts")
+    if method in {"POST", "PUT", "PATCH", "DELETE"}:
+        checks.append("Review authentication, CSRF protection and accepted body fields")
+    return checks
+
+
 def request_record(
     syntax,
     node,
@@ -215,13 +226,7 @@ def request_record(
     if method in {"GET", "HEAD"} and body["kind"] != "none":
         notes.append("Body on GET/HEAD needs manual review; no curl generated")
     path = urlsplit(absolute).path if absolute else template
-    checks = []
-    if re.search(r"/(?:admin|internal|manage)(?:/|$)", path, re.I):
-        checks.append("Check server-side role enforcement using authorized accounts")
-    if re.search(r"/(?:users?|accounts?|tenants?|orders?|files?)(?:/|$)|\{\{", path, re.I):
-        checks.append("Check object and tenant access with two authorized accounts")
-    if method in {"POST", "PUT", "PATCH", "DELETE"}:
-        checks.append("Review authentication, CSRF protection and accepted body fields")
+    checks = review_checks(path, method)
     record = {
         "method": method,
         "url": absolute,
